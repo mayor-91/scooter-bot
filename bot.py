@@ -14,9 +14,12 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Файлы для сохранения состояния
+DATA_FILE = "/app/data/bot_state.json"
+
 # Хранилище
-stats = defaultdict(lambda: defaultdict(int))  # место → тип → кол-во
-photo_log = {}       # номер фото → {"defects": [...], "file_id": ...}
+stats = defaultdict(lambda: defaultdict(int))
+photo_log = {}
 total_photos = 0
 total_defects_found = 0
 seen_hashes = set()
@@ -25,6 +28,47 @@ test_mode = False
 test_limit = 0
 test_count = 0
 bot_chat_id = None
+
+
+def save_state():
+    """Сохранить состояние на диск"""
+    try:
+        os.makedirs(os.path.dirname(DATA_FILE), exist_ok=True)
+        state = {
+            "stats": {k: dict(v) for k, v in stats.items()},
+            "photo_log": {str(k): v for k, v in photo_log.items()},
+            "total_photos": total_photos,
+            "total_defects_found": total_defects_found,
+            "seen_hashes": list(seen_hashes),
+            "bot_chat_id": bot_chat_id,
+        }
+        with open(DATA_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"Ошибка сохранения: {e}")
+
+
+def load_state():
+    """Загрузить состояние с диска при старте"""
+    global stats, photo_log, total_photos, total_defects_found, seen_hashes, bot_chat_id
+    try:
+        if not os.path.exists(DATA_FILE):
+            logger.info("Файл состояния не найден — начинаем с нуля.")
+            return
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            state = json.load(f)
+        for loc, types in state.get("stats", {}).items():
+            for typ, cnt in types.items():
+                stats[loc][typ] = cnt
+        photo_log = {int(k): v for k, v in state.get("photo_log", {}).items()}
+        total_photos = state.get("total_photos", 0)
+        total_defects_found = state.get("total_defects_found", 0)
+        seen_hashes = set(state.get("seen_hashes", []))
+        bot_chat_id = state.get("bot_chat_id")
+        logger.info(f"Состояние загружено: {total_photos} фото, {total_defects_found} дефектов, {len(seen_hashes)} хэшей.")
+    except Exception as e:
+        logger.error(f"Ошибка загрузки состояния: {e}")
+
 
 SYSTEM_PROMPT = """Ты эксперт по анализу дефектов электросамокатов JET (Segway).
 Анализируй фото и определяй дефекты по следующим правилам:
@@ -140,12 +184,12 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if not defects:
             await send_status(context, f"✅ Фото #{total_photos + 1} — дефектов нет.")
+            save_state()
             return
 
         total_photos += 1
         total_defects_found += len(defects)
 
-        # Сохраняем в лог для отладки
         photo_log[total_photos] = {
             "file_id": photo.file_id,
             "defects": [{"location": d["location"], "type": d["type"]} for d in defects]
@@ -156,6 +200,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             stats[d["location"]][d["type"]] += 1
             lines.append(f"• {d['location']}: {d['type']}")
         lines.append(f"\n📊 Всего дефектов: {total_defects_found}")
+
+        save_state()
         await send_status(context, "\n".join(lines))
 
     except Exception as e:
@@ -170,6 +216,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global bot_chat_id
     bot_chat_id = update.effective_chat.id
+    save_state()
     await _show_menu(update)
 
 
@@ -192,11 +239,8 @@ async def _show_menu(update):
     await update.message.reply_text(
         f"🤖 *Бот анализа самокатов JET*\n"
         f"Статус: {status}{mode}\n"
-        f"Фото: {total_photos} | Дефектов: {total_defects_found}\n\n"
-        f"*Команды отладки:*\n"
-        f"`/photo 42` — показать фото и дефекты #42\n"
-        f"`/fix 42 Место: Тип` — исправить дефекты фото #42\n"
-        f"`/test 20` — тест на N фото",
+        f"Фото: {total_photos} | Дефектов: {total_defects_found}\n"
+        f"💾 Хэшей в памяти: {len(seen_hashes)}",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
@@ -220,16 +264,14 @@ async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/photo 42 — показать фото и найденные дефекты"""
     try:
         n = int(context.args[0])
         if n not in photo_log:
             await update.message.reply_text(f"Фото #{n} не найдено в логе.")
             return
         entry = photo_log[n]
-        defects = entry["defects"]
         lines = [f"📸 *Фото #{n}*\n*Найденные дефекты:*"]
-        for i, d in enumerate(defects, 1):
+        for i, d in enumerate(entry["defects"], 1):
             lines.append(f"{i}. {d['location']}: {d['type']}")
         lines.append(f"\n✏️ Чтобы исправить:\n`/fix {n} Место: Тип | Место2: Тип2`")
         await context.bot.send_photo(
@@ -243,7 +285,6 @@ async def cmd_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_fix(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/fix 42 Верхняя часть стойки: Царапины | Диск колеса: Облупившаяся краска"""
     global total_defects_found
     try:
         n = int(context.args[0])
@@ -251,11 +292,10 @@ async def cmd_fix(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"Фото #{n} не найдено.")
             return
 
-        # Парсим новые дефекты из аргументов
         raw = " ".join(context.args[1:])
         if not raw:
             await update.message.reply_text(
-                f"Использование:\n`/fix {n} Место: Тип | Место2: Тип2`\n\nПример:\n`/fix {n} Верхняя часть стойки: Царапины`",
+                f"Использование:\n`/fix {n} Место: Тип | Место2: Тип2`",
                 parse_mode="Markdown"
             )
             return
@@ -268,24 +308,25 @@ async def cmd_fix(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 new_defects.append({"location": loc.strip(), "type": typ.strip()})
 
         if not new_defects:
-            await update.message.reply_text("Не удалось распознать формат. Используй: `Место: Тип | Место2: Тип2`", parse_mode="Markdown")
+            await update.message.reply_text("Не удалось распознать формат.", parse_mode="Markdown")
             return
 
-        # Откатываем старые дефекты из статистики
-        old_defects = photo_log[n]["defects"]
-        for d in old_defects:
+        # Откатываем старые
+        for d in photo_log[n]["defects"]:
             stats[d["location"]][d["type"]] -= 1
             if stats[d["location"]][d["type"]] <= 0:
                 del stats[d["location"]][d["type"]]
             if not stats[d["location"]]:
                 del stats[d["location"]]
-        total_defects_found -= len(old_defects)
+        total_defects_found -= len(photo_log[n]["defects"])
 
         # Записываем новые
         for d in new_defects:
             stats[d["location"]][d["type"]] += 1
         total_defects_found += len(new_defects)
         photo_log[n]["defects"] = new_defects
+
+        save_state()
 
         lines = [f"✅ *Фото #{n} исправлено!*\n*Новые дефекты:*"]
         for d in new_defects:
@@ -298,6 +339,7 @@ async def cmd_fix(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global counting_active, test_mode, bot_chat_id, stats, total_photos, total_defects_found
+
     query = update.callback_query
     await query.answer()
     bot_chat_id = update.effective_chat.id
@@ -305,7 +347,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.data == "start_count":
         counting_active = True
         test_mode = False
-        await query.edit_message_text("▶️ *Подсчёт начат!*\nОтправляй фото в группу — статусы буду слать сюда.\n\nНажми /menu для управления.", parse_mode="Markdown")
+        await query.edit_message_text(
+            "▶️ *Подсчёт начат!*\nОтправляй фото в группу — статусы буду слать сюда.\n\nНажми /menu для управления.",
+            parse_mode="Markdown"
+        )
 
     elif query.data == "stop_count":
         counting_active = False
@@ -320,11 +365,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "ℹ️ *Инструкция*\n\n"
             "*Основные команды:*\n"
             "/menu — главное меню\n"
-            "/test 20 — тест на 20 фото (бот остановится сам)\n\n"
+            "/test 20 — тест на 20 фото\n\n"
             "*Отладка:*\n"
-            "`/photo 42` — показать фото #42 и его дефекты\n\n"
-            "`/fix 42 Место: Тип` — исправить дефекты фото #42\n"
-            "Несколько дефектов через `|`:\n"
+            "`/photo 42` — показать фото #42 и дефекты\n"
+            "`/fix 42 Место: Тип` — исправить дефекты\n"
+            "Несколько через `|`:\n"
             "`/fix 42 Верхняя часть стойки: Царапины | Диск колеса: Облупившаяся краска`\n\n"
             "*Места дефектов:*\n"
             "• Диск колеса (передний/задний)\n"
@@ -343,7 +388,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• Вмятина/деформация\n"
             "• Механическая поломка\n"
             "• Отсутствие детали\n\n"
-            "Нажми /menu чтобы вернуться назад.",
+            "Нажми /menu чтобы вернуться.",
             parse_mode="Markdown"
         )
 
@@ -353,6 +398,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         photo_log.clear()
         total_photos = 0
         total_defects_found = 0
+        save_state()
         await query.edit_message_text("🔄 Всё сброшено. Нажми /menu чтобы начать заново.")
 
 
@@ -371,6 +417,7 @@ async def _send_stats(chat_id, context):
 
 
 def main():
+    load_state()
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("menu", cmd_menu))
