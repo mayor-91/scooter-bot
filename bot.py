@@ -4,7 +4,6 @@ import base64
 import hashlib
 import logging
 import time
-import asyncio
 from collections import defaultdict
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, MessageHandler, CommandHandler, CallbackQueryHandler, filters, ContextTypes
@@ -17,10 +16,10 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 DATA_FILE = "/app/data/bot_state.json"
-STATUS_EVERY = 10  # Статус каждые N обработанных фото
+STATUS_EVERY = 10
 
 # Хранилище
-stats = defaultdict(lambda: defaultdict(int))
+stats = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))  # город → место → тип
 photo_log = {}
 total_photos = 0
 total_defects_found = 0
@@ -30,15 +29,15 @@ test_mode = False
 test_limit = 0
 test_count = 0
 bot_chat_id = None
-start_time = None        # Время начала подсчёта
-photos_per_minute = []   # Список временных меток для расчёта скорости
+start_time = None
+photos_per_minute = []
 
 
 def save_state():
     try:
         os.makedirs(os.path.dirname(DATA_FILE), exist_ok=True)
         state = {
-            "stats": {k: dict(v) for k, v in stats.items()},
+            "stats": {city: {loc: dict(types) for loc, types in locs.items()} for city, locs in stats.items()},
             "photo_log": {str(k): v for k, v in photo_log.items()},
             "total_photos": total_photos,
             "total_defects_found": total_defects_found,
@@ -55,13 +54,13 @@ def load_state():
     global stats, photo_log, total_photos, total_defects_found, seen_hashes, bot_chat_id
     try:
         if not os.path.exists(DATA_FILE):
-            logger.info("Файл состояния не найден — начинаем с нуля.")
             return
         with open(DATA_FILE, "r", encoding="utf-8") as f:
             state = json.load(f)
-        for loc, types in state.get("stats", {}).items():
-            for typ, cnt in types.items():
-                stats[loc][typ] = cnt
+        for city, locs in state.get("stats", {}).items():
+            for loc, types in locs.items():
+                for typ, cnt in types.items():
+                    stats[city][loc][typ] = cnt
         photo_log = {int(k): v for k, v in state.get("photo_log", {}).items()}
         total_photos = state.get("total_photos", 0)
         total_defects_found = state.get("total_defects_found", 0)
@@ -73,14 +72,12 @@ def load_state():
 
 
 def get_speed_and_eta(remaining):
-    """Считает скорость и оставшееся время"""
     now = time.time()
-    # Берём метки за последние 5 минут
     recent = [t for t in photos_per_minute if now - t < 300]
     if len(recent) < 2:
         return None, None
     elapsed = now - recent[0]
-    speed = len(recent) / elapsed * 60  # фото в минуту
+    speed = len(recent) / elapsed * 60
     if speed <= 0:
         return None, None
     eta_minutes = remaining / speed
@@ -108,17 +105,25 @@ SYSTEM_PROMPT = """Ты эксперт по анализу дефектов эл
 - Если на фото 1-2 самоката крупно с видимыми дефектами → анализируй дефекты
 - Если фото не связано с самокатами → is_scooter: false
 
-МЕСТА дефектов:
-- Диск колеса (передний/задний)
+ВАЖНО ПРО ФОКУС:
+- Если на фото несколько самокатов — анализируй ТОЛЬКО тот что на переднем плане или в фокусе
+- Самокаты на заднем плане, размытые или частично видимые — игнорируй полностью
+
+МЕСТА дефектов (используй ТОЛЬКО эти названия):
+- Диск колеса переднего
+- Диск колеса заднего
 - Тормозной диск/механизм
-- Верхняя часть стойки
-- Нижняя часть стойки
+- Стакан (соединение стойки с рамой)
+- Верхняя часть стойки (выше стакана)
+- Нижняя часть стойки (ниже стакана)
 - Дека (платформа)
 - Заднее крыло
 - Переднее крыло
-- Фонарь (передний/задний)
+- Фонарь передний
+- Фонарь задний
 - Номерная табличка
 - Ручки руля
+- Крючок стойки (пластиковый крючок для кабеля на стойке)
 - Аккумулятор/батарея
 
 ТИПЫ дефектов:
@@ -178,13 +183,25 @@ async def analyze_photo(image_data: bytes) -> dict:
     return json.loads(response_text)
 
 
+def get_city_from_update(update: Update) -> str:
+    """Автоматически получить название города из темы группы"""
+    try:
+        if update.message.reply_to_message and update.message.reply_to_message.forum_topic_created:
+            return update.message.reply_to_message.forum_topic_created.name
+        # Берём из контекста сообщения если доступно
+        if hasattr(update.message, 'forum_topic_created') and update.message.forum_topic_created:
+            return update.message.forum_topic_created.name
+    except Exception:
+        pass
+    return None
+
+
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global total_photos, total_defects_found, counting_active, test_mode, test_count
 
     if not counting_active:
         return
 
-    # Тест режим: проверяем лимит
     if test_mode:
         if test_count >= test_limit:
             counting_active = False
@@ -199,19 +216,29 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         test_count += 1
 
+    # Получаем город из названия темы
+    city = "Без города"
+    try:
+        if update.message.message_thread_id:
+            # Ищем в кэше тем
+            thread_id = str(update.message.message_thread_id)
+            city = context.bot_data.get(f"topic_{thread_id}", "Без города")
+    except Exception:
+        pass
+
     photo = update.message.photo[-1]
     file = await context.bot.get_file(photo.file_id)
     image_data = await file.download_as_bytearray()
 
     photo_hash = hashlib.md5(bytes(image_data)).hexdigest()
     if photo_hash in seen_hashes:
-        return  # Дубли пропускаем тихо
+        return
 
     try:
         result = await analyze_photo(bytes(image_data))
 
         if not result.get("is_scooter", True):
-            return  # Не самокат — тихо пропускаем
+            return
 
         defects = result.get("defects", [])
         seen_hashes.add(photo_hash)
@@ -226,32 +253,29 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         photo_log[total_photos] = {
             "file_id": photo.file_id,
+            "city": city,
             "defects": [{"location": d["location"], "type": d["type"]} for d in defects]
         }
         for d in defects:
-            stats[d["location"]][d["type"]] += 1
+            stats[city][d["location"]][d["type"]] += 1
 
         save_state()
 
-        # Периодический статус каждые STATUS_EVERY фото
+        # Периодический статус
         if total_photos % STATUS_EVERY == 0:
             remaining = test_limit - test_count if test_mode else None
             speed, eta = get_speed_and_eta(remaining or 0)
-            eta_str = format_eta(eta) if remaining else ""
-            progress = f"{test_count}/{test_limit}" if test_mode else f"{total_photos}"
-
+            progress = f"{test_count}/{test_limit}" if test_mode else str(total_photos)
             msg = (
                 f"📊 *Статус* — обработано {progress} фото\n"
                 f"Дефектов найдено: {total_defects_found}\n"
-                f"Скорость: {speed} фото/мин\n"
+                f"Скорость: {speed if speed else '...'} фото/мин\n"
             )
             if remaining and eta:
-                msg += f"Осталось: ~{remaining} фото, {eta_str}"
+                msg += f"Осталось: ~{remaining} фото, {format_eta(eta)}"
             await send_status(context, msg)
-
-        # Каждое фото с дефектом — короткое уведомление
         else:
-            lines = [f"📸 *#{total_photos}* — {len(defects)} деф."]
+            lines = [f"📸 *#{total_photos}* [{city}] — {len(defects)} деф."]
             for d in defects:
                 lines.append(f"• {d['location']}: {d['type']}")
             await send_status(context, "\n".join(lines))
@@ -259,6 +283,18 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Ошибка: {e}")
         await send_status(context, f"⚠️ Ошибка на фото #{total_photos + 1}: `{str(e)[:100]}`\nБот продолжает работу.")
+
+
+async def handle_forum_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Кэшируем название темы при её создании или когда бот видит сообщение из темы"""
+    try:
+        if update.message and update.message.forum_topic_created:
+            thread_id = str(update.message.message_thread_id)
+            topic_name = update.message.forum_topic_created.name
+            context.bot_data[f"topic_{thread_id}"] = topic_name
+            logger.info(f"Тема закэширована: {thread_id} → {topic_name}")
+    except Exception as e:
+        logger.error(f"Ошибка кэширования темы: {e}")
 
 
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -279,21 +315,16 @@ async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Запросить текущий статус"""
     if not counting_active:
         await update.message.reply_text(
-            f"⏹ *Бот остановлен*\nФото обработано: {total_photos}\nДефектов: {total_defects_found}",
+            f"⏹ *Бот остановлен*\nФото: {total_photos} | Дефектов: {total_defects_found}",
             parse_mode="Markdown"
         )
         return
-
     remaining = test_limit - test_count if test_mode else None
     speed, eta = get_speed_and_eta(remaining or 0)
     progress = f"{test_count}/{test_limit}" if test_mode else str(total_photos)
-    eta_str = format_eta(eta) if (remaining and eta) else "считаю..."
-
     elapsed_min = round((time.time() - start_time) / 60, 1) if start_time else "?"
-
     msg = (
         f"▶️ *Бот работает*\n"
         f"Обработано: {progress} фото\n"
@@ -301,10 +332,55 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Скорость: {speed if speed else '...'} фото/мин\n"
         f"Времени прошло: {elapsed_min} мин\n"
     )
-    if remaining:
-        msg += f"Осталось: ~{remaining} фото, {eta_str}"
-
+    if remaining and eta:
+        msg += f"Осталось: ~{remaining} фото, {format_eta(eta)}"
     await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+async def cmd_topics(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать все закэшированные темы"""
+    topics = {k.replace("topic_", ""): v for k, v in context.bot_data.items() if k.startswith("topic_")}
+    if not topics:
+        await update.message.reply_text(
+            "📋 Темы пока не определены.\n\n"
+            "Бот автоматически запомнит название темы когда увидит первое фото из неё.\n"
+            "Напиши `/setcity ID Название` чтобы задать вручную.",
+            parse_mode="Markdown"
+        )
+        return
+    lines = ["📋 *Известные темы:*\n"]
+    for tid, name in topics.items():
+        lines.append(f"• {name} (id: {tid})")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def cmd_setcity(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/setcity ID Название — задать название темы вручную"""
+    try:
+        thread_id = context.args[0]
+        city_name = " ".join(context.args[1:])
+        if not city_name:
+            raise ValueError
+        context.bot_data[f"topic_{thread_id}"] = city_name
+        await update.message.reply_text(f"✅ Тема {thread_id} → *{city_name}*", parse_mode="Markdown")
+    except (IndexError, ValueError):
+        await update.message.reply_text(
+            "Использование: `/setcity ID Название`\n"
+            "ID темы узнай из /topics или напиши в теме /getid",
+            parse_mode="Markdown"
+        )
+
+
+async def cmd_getid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    thread_id = update.message.message_thread_id
+    if thread_id:
+        city = context.bot_data.get(f"topic_{thread_id}", "не определён")
+        await update.message.reply_text(
+            f"📍 ID этой темы: `{thread_id}`\nГород: {city}",
+            parse_mode="Markdown"
+        )
+    else:
+        await update.message.reply_text("Команда работает только внутри темы группы.")
 
 
 async def _show_menu(update):
@@ -321,8 +397,9 @@ async def _show_menu(update):
         f"🤖 *Бот анализа самокатов JET*\n"
         f"Статус: {status}{mode}\n"
         f"Фото: {total_photos} | Дефектов: {total_defects_found}\n"
-        f"💾 Хэшей в памяти: {len(seen_hashes)}\n\n"
-        f"/status — текущий прогресс",
+        f"💾 Хэшей: {len(seen_hashes)}\n\n"
+        f"/status — текущий прогресс\n"
+        f"/topics — список определённых городов",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
@@ -342,8 +419,8 @@ async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"🧪 *Тест запущен!*\n"
             f"Обработаю первые *{n} фото* и остановлюсь.\n"
-            f"Статус буду присылать каждые {STATUS_EVERY} фото.\n"
-            f"Напиши /status чтобы узнать прогресс в любой момент.",
+            f"Статус каждые {STATUS_EVERY} фото.\n"
+            f"/status — прогресс в любой момент.",
             parse_mode="Markdown"
         )
     except (IndexError, ValueError):
@@ -354,13 +431,14 @@ async def cmd_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         n = int(context.args[0])
         if n not in photo_log:
-            await update.message.reply_text(f"Фото #{n} не найдено в логе.")
+            await update.message.reply_text(f"Фото #{n} не найдено.")
             return
         entry = photo_log[n]
-        lines = [f"📸 *Фото #{n}*\n*Найденные дефекты:*"]
+        city = entry.get("city", "Без города")
+        lines = [f"📸 *Фото #{n}* [{city}]\n*Дефекты:*"]
         for i, d in enumerate(entry["defects"], 1):
             lines.append(f"{i}. {d['location']}: {d['type']}")
-        lines.append(f"\n✏️ Чтобы исправить:\n`/fix {n} Место: Тип | Место2: Тип2`")
+        lines.append(f"\n✏️ `/fix {n} Место: Тип | Место2: Тип2`")
         await context.bot.send_photo(
             chat_id=update.effective_chat.id,
             photo=entry["file_id"],
@@ -391,15 +469,12 @@ async def cmd_fix(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not new_defects:
             await update.message.reply_text("Не удалось распознать формат.")
             return
+        city = photo_log[n].get("city", "Без города")
         for d in photo_log[n]["defects"]:
-            stats[d["location"]][d["type"]] -= 1
-            if stats[d["location"]][d["type"]] <= 0:
-                del stats[d["location"]][d["type"]]
-            if not stats[d["location"]]:
-                del stats[d["location"]]
+            stats[city][d["location"]][d["type"]] -= 1
         total_defects_found -= len(photo_log[n]["defects"])
         for d in new_defects:
-            stats[d["location"]][d["type"]] += 1
+            stats[city][d["location"]][d["type"]] += 1
         total_defects_found += len(new_defects)
         photo_log[n]["defects"] = new_defects
         save_state()
@@ -413,7 +488,6 @@ async def cmd_fix(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global counting_active, test_mode, bot_chat_id, stats, total_photos, total_defects_found, start_time
-
     query = update.callback_query
     await query.answer()
     bot_chat_id = update.effective_chat.id
@@ -426,52 +500,36 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             "▶️ *Подсчёт начат!*\n"
             "Отправляй фото в группу — статусы буду слать сюда.\n"
-            f"Статус каждые {STATUS_EVERY} фото, или напиши /status.\n\n"
+            f"Статус каждые {STATUS_EVERY} фото, или /status.\n\n"
+            "Города определяются автоматически из названий тем.\n"
             "Нажми /menu для управления.",
             parse_mode="Markdown"
         )
-
     elif query.data == "stop_count":
         counting_active = False
         test_mode = False
         await query.edit_message_text("⏹ *Подсчёт остановлен.*\nНажми /menu чтобы продолжить.", parse_mode="Markdown")
-
     elif query.data == "show_stats":
         await _send_stats(query.message.chat_id, context)
-
     elif query.data == "help":
         await query.edit_message_text(
             "ℹ️ *Инструкция*\n\n"
-            "*Основные команды:*\n"
+            "*Основные:*\n"
             "/menu — главное меню\n"
-            "/status — текущий прогресс и скорость\n"
-            "/test 20 — тест на 20 фото\n\n"
+            "/status — прогресс и скорость\n"
+            "/test 20 — тест на 20 фото\n"
+            "/topics — список городов\n\n"
+            "*Если город не определился:*\n"
+            "Зайди в тему → /getid → запомни ID\n"
+            "`/setcity ID Название города`\n\n"
             "*Отладка:*\n"
-            "`/photo 42` — показать фото #42 и дефекты\n"
-            "`/fix 42 Место: Тип` — исправить дефекты\n"
-            "Несколько через `|`:\n"
-            "`/fix 42 Верхняя часть стойки: Царапины | Диск колеса: Облупившаяся краска`\n\n"
-            "*Места дефектов:*\n"
-            "• Диск колеса (передний/задний)\n"
-            "• Тормозной диск/механизм\n"
-            "• Верхняя часть стойки\n"
-            "• Нижняя часть стойки\n"
-            "• Дека (платформа)\n"
-            "• Заднее/Переднее крыло\n"
-            "• Фонарь (передний/задний)\n"
-            "• Номерная табличка\n"
-            "• Ручки руля\n\n"
-            "*Типы дефектов:*\n"
-            "• Облупившаяся краска\n"
-            "• Царапины\n"
-            "• Трещина/скол\n"
-            "• Вмятина/деформация\n"
-            "• Механическая поломка\n"
-            "• Отсутствие детали\n\n"
+            "`/photo 42` — фото #42 и дефекты\n"
+            "`/fix 42 Место: Тип | Место2: Тип2`\n\n"
+            "*Места:* Диск колеса переднего/заднего, Тормозной диск/механизм, Стакан, Верхняя/Нижняя часть стойки, Дека, Заднее/Переднее крыло, Фонарь передний/задний, Номерная табличка, Ручки руля\n\n"
+            "*Типы:* Облупившаяся краска, Царапины, Трещина/скол, Вмятина/деформация, Механическая поломка, Отсутствие детали\n\n"
             "Нажми /menu чтобы вернуться.",
             parse_mode="Markdown"
         )
-
     elif query.data == "reset":
         stats.clear()
         seen_hashes.clear()
@@ -486,13 +544,19 @@ async def _send_stats(chat_id, context):
     if not stats:
         await context.bot.send_message(chat_id=chat_id, text="📊 Статистика пуста.")
         return
+
     lines = [f"📊 *Статистика дефектов*\nФото: {total_photos} | Дефектов: {total_defects_found}\n"]
-    for location, types in sorted(stats.items()):
-        loc_total = sum(types.values())
-        lines.append(f"\n📍 *{location}* — {loc_total}")
-        for defect_type, count in sorted(types.items(), key=lambda x: -x[1]):
-            lines.append(f"  • {defect_type}: {count}")
-    lines.append(f"\n\n🔢 *Итого: {total_defects_found}*")
+
+    for city, locations in sorted(stats.items()):
+        city_total = sum(sum(types.values()) for types in locations.values())
+        lines.append(f"\n🏙 *{city}* — {city_total} дефектов")
+        for location, types in sorted(locations.items()):
+            loc_total = sum(types.values())
+            lines.append(f"  📍 {location} — {loc_total}")
+            for defect_type, count in sorted(types.items(), key=lambda x: -x[1]):
+                lines.append(f"    • {defect_type}: {count}")
+
+    lines.append(f"\n🔢 *Итого: {total_defects_found}*")
     await context.bot.send_message(chat_id=chat_id, text="\n".join(lines), parse_mode="Markdown")
 
 
@@ -505,9 +569,13 @@ def main():
     app.add_handler(CommandHandler("test", cmd_test))
     app.add_handler(CommandHandler("photo", cmd_photo))
     app.add_handler(CommandHandler("fix", cmd_fix))
+    app.add_handler(CommandHandler("topics", cmd_topics))
+    app.add_handler(CommandHandler("setcity", cmd_setcity))
+    app.add_handler(CommandHandler("getid", cmd_getid))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.VIDEO | filters.VIDEO_NOTE, handle_video))
+    app.add_handler(MessageHandler(filters.StatusUpdate.FORUM_TOPIC_CREATED, handle_forum_topic))
     logger.info("Бот запущен!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
