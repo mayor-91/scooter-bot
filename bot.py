@@ -8,8 +8,8 @@ from telegram.ext import Application, MessageHandler, CommandHandler, CallbackQu
 import anthropic
 
 # ===== ВСТАВЬ СЮДА СВОИ КЛЮЧИ =====
-TELEGRAM_TOKEN = "ВСТАВЬ_ТОКЕН_БОТА_СЮДА"
-ANTHROPIC_API_KEY = "ВСТАВЬ_API_КЛЮЧ_СЮДА"
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 # ====================================
 
 logging.basicConfig(level=logging.INFO)
