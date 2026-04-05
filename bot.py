@@ -1,11 +1,10 @@
-import os
 import json
 import base64
 import hashlib
 import logging
 from collections import defaultdict
-from telegram import Update
-from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, MessageHandler, CommandHandler, CallbackQueryHandler, filters, ContextTypes
 import anthropic
 
 # ===== ВСТАВЬ СЮДА СВОИ КЛЮЧИ =====
@@ -19,7 +18,10 @@ logger = logging.getLogger(__name__)
 # Хранилище статистики
 stats = defaultdict(lambda: defaultdict(int))
 total_photos = 0
-seen_hashes = set()  # Для защиты от дублей
+total_defects_found = 0
+seen_hashes = set()
+counting_active = False  # Режим подсчёта вкл/выкл
+bot_chat_id = None  # ID чата с самим ботом (куда слать статусы)
 
 SYSTEM_PROMPT = """Ты эксперт по анализу дефектов электросамокатов JET (Segway).
 Анализируй фото и определяй дефекты по следующим правилам:
@@ -62,42 +64,48 @@ SYSTEM_PROMPT = """Ты эксперт по анализу дефектов эл
 Отвечай ТОЛЬКО в формате JSON, без лишнего текста:
 {
   "defects": [
-    {"location": "место", "type": "тип дефекта"},
     {"location": "место", "type": "тип дефекта"}
   ],
   "is_scooter": true/false
 }"""
 
 
+async def send_status(context: ContextTypes.DEFAULT_TYPE, text: str):
+    """Отправить статус боту в личку (в чат с самим собой)"""
+    global bot_chat_id
+    if bot_chat_id:
+        try:
+            await context.bot.send_message(chat_id=bot_chat_id, text=text)
+        except Exception as e:
+            logger.error(f"Не удалось отправить статус: {e}")
+
+
 async def analyze_photo(image_data: bytes) -> dict:
     """Анализ фото через Claude API"""
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    
     image_base64 = base64.standard_b64encode(image_data).decode("utf-8")
     
     message = client.messages.create(
         model="claude-opus-4-5",
         max_tokens=1000,
         system=SYSTEM_PROMPT,
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "image/jpeg",
-                            "data": image_base64,
-                        },
+        messages=[{
+            "role": "user",
+            "content": [
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/jpeg",
+                        "data": image_base64,
                     },
-                    {
-                        "type": "text",
-                        "text": "Проанализируй дефекты на этом фото самоката."
-                    }
-                ],
-            }
-        ],
+                },
+                {
+                    "type": "text",
+                    "text": "Проанализируй дефекты на этом фото самоката."
+                }
+            ],
+        }],
     )
     
     response_text = message.content[0].text.strip()
@@ -110,103 +118,164 @@ async def analyze_photo(image_data: bytes) -> dict:
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка входящего фото"""
-    global total_photos
-    
-    # Берём фото наилучшего качества
+    """Обработка входящего фото — тихо в группе, статусы себе"""
+    global total_photos, total_defects_found, counting_active
+
+    # Если подсчёт не активен — игнорируем
+    if not counting_active:
+        return
+
     photo = update.message.photo[-1]
     file = await context.bot.get_file(photo.file_id)
     image_data = await file.download_as_bytearray()
-    
-    # Проверка на дубль по MD5 хэшу
+
+    # Проверка на дубль
     photo_hash = hashlib.md5(bytes(image_data)).hexdigest()
     if photo_hash in seen_hashes:
-        await update.message.reply_text("🔁 Дубль — это фото уже было, пропускаю.")
+        await send_status(context, "🔁 Дубль — пропускаю.")
         return
-    
-    await update.message.reply_text("🔍 Анализирую...")
-    
+
     try:
         result = await analyze_photo(bytes(image_data))
-        
+
         if not result.get("is_scooter", True):
-            await update.message.reply_text("⏭ Пропускаю: батарея, общий вид или не самокат.")
+            await send_status(context, "⏭ Пропускаю: батарея, общий вид или не самокат.")
             return
-        
+
         defects = result.get("defects", [])
-        
-        if not defects:
-            await update.message.reply_text("✅ Дефектов не обнаружено.")
-            seen_hashes.add(photo_hash)
-            return
-        
-        # Фото принято — сохраняем хэш
         seen_hashes.add(photo_hash)
+
+        if not defects:
+            await send_status(context, f"✅ Фото #{total_photos + 1} — дефектов нет.")
+            return
+
         total_photos += 1
-        
-        # Сохраняем в статистику
-        response_lines = [f"📸 Фото #{total_photos} — найдено дефектов: {len(defects)}\n"]
+        total_defects_found += len(defects)
+
+        lines = [f"📸 Фото #{total_photos} — дефектов: {len(defects)}\n"]
         for d in defects:
             location = d["location"]
             defect_type = d["type"]
             stats[location][defect_type] += 1
-            response_lines.append(f"• {location}: {defect_type}")
-        
-        await update.message.reply_text("\n".join(response_lines))
-        
+            lines.append(f"• {location}: {defect_type}")
+
+        lines.append(f"\n📊 Итого дефектов: {total_defects_found}")
+        await send_status(context, "\n".join(lines))
+
     except Exception as e:
         logger.error(f"Ошибка анализа: {e}")
-        await update.message.reply_text("❌ Ошибка при анализе фото. Попробуй ещё раз.")
+        await send_status(context, "❌ Ошибка при анализе фото.")
 
 
-async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показать текущую статистику"""
+async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Видео — молча игнорируем"""
+    pass
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /start — регистрирует чат бота для статусов"""
+    global bot_chat_id
+    bot_chat_id = update.effective_chat.id
+
+    keyboard = [
+        [InlineKeyboardButton("▶️ Начать подсчёт", callback_data="start_count")],
+        [InlineKeyboardButton("⏹ Остановить подсчёт", callback_data="stop_count")],
+        [InlineKeyboardButton("📊 Статистика", callback_data="show_stats")],
+        [InlineKeyboardButton("🔄 Сбросить всё", callback_data="reset")],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await update.message.reply_text(
+        "👋 Привет! Я анализирую дефекты самокатов JET.\n\n"
+        "📌 Добавь меня в группу где публикуются фото.\n"
+        "📲 Статусы буду присылать сюда — в этот чат.\n\n"
+        "Нажми *▶️ Начать подсчёт* когда готов:",
+        parse_mode="Markdown",
+        reply_markup=reply_markup
+    )
+
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка нажатий кнопок"""
+    global counting_active, bot_chat_id, stats, total_photos, total_defects_found
+
+    query = update.callback_query
+    await query.answer()
+    bot_chat_id = update.effective_chat.id
+
+    if query.data == "start_count":
+        counting_active = True
+        await query.edit_message_text(
+            "▶️ *Подсчёт начат!*\n\n"
+            "Отправляй фото в группу — я буду присылать статусы сюда.\n"
+            "Нажми /menu чтобы вернуть кнопки управления.",
+            parse_mode="Markdown"
+        )
+
+    elif query.data == "stop_count":
+        counting_active = False
+        await query.edit_message_text(
+            "⏹ *Подсчёт остановлен.*\n\nНажми /menu чтобы продолжить.",
+            parse_mode="Markdown"
+        )
+
+    elif query.data == "show_stats":
+        await _send_stats(query.message.chat_id, context)
+
+    elif query.data == "reset":
+        stats.clear()
+        seen_hashes.clear()
+        total_photos = 0
+        total_defects_found = 0
+        await query.edit_message_text("🔄 Статистика сброшена. Нажми /menu чтобы начать заново.")
+
+
+async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать меню с кнопками"""
+    global bot_chat_id
+    bot_chat_id = update.effective_chat.id
+
+    status = "▶️ активен" if counting_active else "⏹ остановлен"
+    keyboard = [
+        [InlineKeyboardButton("▶️ Начать подсчёт", callback_data="start_count")],
+        [InlineKeyboardButton("⏹ Остановить подсчёт", callback_data="stop_count")],
+        [InlineKeyboardButton("📊 Статистика", callback_data="show_stats")],
+        [InlineKeyboardButton("🔄 Сбросить всё", callback_data="reset")],
+    ]
+    await update.message.reply_text(
+        f"🤖 Бот анализа самокатов\nСтатус: {status}\nОбработано фото: {total_photos}",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+async def _send_stats(chat_id, context):
+    """Внутренняя функция отправки статистики"""
     if not stats:
-        await update.message.reply_text("📊 Статистика пуста. Отправь фото самокатов!")
+        await context.bot.send_message(chat_id=chat_id, text="📊 Статистика пуста.")
         return
-    
-    lines = [f"📊 *Статистика дефектов* (обработано фото: {total_photos})\n"]
-    
-    total_defects = 0
+
+    lines = [f"📊 *Статистика дефектов*\nОбработано фото: {total_photos} | Дефектов: {total_defects_found}\n"]
     for location, types in sorted(stats.items()):
         lines.append(f"\n📍 *{location}*")
         for defect_type, count in sorted(types.items(), key=lambda x: -x[1]):
             lines.append(f"  • {defect_type}: {count}")
-            total_defects += count
-    
-    lines.append(f"\n\n🔢 *Всего дефектов: {total_defects}*")
-    
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
-
-async def reset_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Сброс статистики"""
-    global total_photos
-    stats.clear()
-    seen_hashes.clear()
-    total_photos = 0
-    await update.message.reply_text("🔄 Статистика и список дублей сброшены.")
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 Привет! Я анализирую дефекты самокатов JET.\n\n"
-        "📸 Отправляй фото — я определю дефекты и место.\n"
-        "🔁 Дубли автоматически пропускаются.\n\n"
-        "Команды:\n"
-        "/stats — показать статистику\n"
-        "/reset — сбросить статистику"
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="\n".join(lines),
+        parse_mode="Markdown"
     )
 
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
-    
+
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("stats", show_stats))
-    app.add_handler(CommandHandler("reset", reset_stats))
+    app.add_handler(CommandHandler("menu", menu))
+    app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    
+    app.add_handler(MessageHandler(filters.VIDEO | filters.VIDEO_NOTE, handle_video))
+
     logger.info("Бот запущен!")
     app.run_polling()
 
